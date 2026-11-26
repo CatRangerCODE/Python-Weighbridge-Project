@@ -199,14 +199,15 @@ def table_path(name):
     return DATA_DIR / f"{name}.csv"
 
 
+def missing_tables():
+    return [name for name in SCHEMAS if not table_path(name).exists()]
+
+
 def init_storage():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     for folder in (EXPORT_DIR, BACKUP_DIR, LOG_DIR, RECEIPT_DIR):
         folder.mkdir(exist_ok=True)
-    missing = {
-        name: SEED_DATA.get(name, [])
-        for name in SCHEMAS if not table_path(name).exists()
-    }
+    missing = {name: SEED_DATA.get(name, []) for name in missing_tables()}
     if missing:
         write_tables(missing)
 
@@ -367,6 +368,15 @@ def check_data():
     tables = {}
     for name in SCHEMAS:
         try:
+            with open(table_path(name), newline="", encoding="utf-8-sig") as handle:
+                header = next(csv.reader(handle), [])
+            if not any(h.strip() for h in header):
+                problems.append(f"{name}.csv has no header row")
+                continue
+            absent = [field for field in SCHEMAS[name] if field not in header]
+            if absent:
+                problems.append(f"{name}.csv header is missing column(s): {', '.join(absent)}")
+                continue
             tables[name] = read_table(name)
         except (OSError, csv.Error, UnicodeDecodeError) as exc:
             problems.append(f"{name}.csv could not be read: {exc}")
@@ -1796,8 +1806,7 @@ def main(argv=None):
 
     if args.check:
         # Read-only: do not create folders, seed tables or open the log file.
-        missing = [f"{table_path(name)}: file is missing"
-                   for name in SCHEMAS if not table_path(name).exists()]
+        missing = [f"{table_path(name)}: file is missing" for name in missing_tables()]
         if missing:
             for problem in missing:
                 print(f"  {problem}")
@@ -1825,6 +1834,22 @@ def main(argv=None):
         info("Use the window that is already open. Two copies would overwrite each other's tickets.")
         return 1
     try:
+        missing = missing_tables()
+        new_install = len(missing) == len(SCHEMAS)
+        if missing and not new_install:
+            # An existing data folder has lost files: say so before replacing
+            # them with empty ones, so lost tickets are not hidden.
+            heading("DATA FILES MISSING")
+            for name in missing:
+                warn(f"{table_path(name)} is missing")
+            info("Close the program to restore the files from a backup, "
+                 "or check that the right data folder is in use.")
+            try:
+                input("  Press Enter to create empty files and continue: ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                lock.close()
+                return 1
         init_storage()
         setup_logging()
     except OSError as exc:
@@ -1832,6 +1857,11 @@ def main(argv=None):
         error(f"Cannot use the data folder {DATA_DIR}: {exc}")
         return 1
     log.info("Started version %s by %s, data %s", __version__, current_user(), DATA_DIR)
+    if new_install:
+        log.info("New data folder set up")
+    elif missing:
+        log.warning("Created empty missing data file(s): %s",
+                    ", ".join(f"{name}.csv" for name in missing))
     try:
         try:
             problems = check_data()
