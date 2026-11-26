@@ -98,6 +98,13 @@ class InputClosed(Cancelled):
     """The terminal input ended, no more answers can be read."""
 
 
+class DeferredInterrupt(KeyboardInterrupt):
+    """Ctrl+C that was held back until the protected block had finished.
+
+    Raised by commit() only after every table was written.
+    """
+
+
 log = logging.getLogger("weighbridge")
 log.addHandler(logging.NullHandler())
 
@@ -251,7 +258,7 @@ def interrupts_deferred():
     finally:
         signal.signal(signal.SIGINT, previous)
     if received:
-        raise KeyboardInterrupt
+        raise DeferredInterrupt
 
 
 def commit(changes):
@@ -357,8 +364,15 @@ def check_data():
     def bad(table, line, text):
         problems.append(f"{table}.csv line {line}: {text}")
 
+    tables = {}
+    for name in SCHEMAS:
+        try:
+            tables[name] = read_table(name)
+        except (OSError, csv.Error, UnicodeDecodeError) as exc:
+            problems.append(f"{name}.csv could not be read: {exc}")
+
     seen = set()
-    for line, t in enumerate(read_table("tickets"), 2):
+    for line, t in enumerate(tables.get("tickets", []), 2):
         for field in TICKET_INT_FIELDS:
             if t[field] and not is_whole(t[field]):
                 bad("tickets", line, f"{field} is not a whole number ({t[field]!r})")
@@ -373,6 +387,8 @@ def check_data():
             bad("tickets", line, "first_weight is missing")
         if t["status"] in ("REVIEW", "COMPLETE") and not (t["second_weight"] and t["payable_weight"]):
             bad("tickets", line, f"{t['status']} ticket has no second or total weight")
+        if t["status"] in ("REVIEW", "COMPLETE") and not t["product_weight"]:
+            bad("tickets", line, f"{t['status']} ticket has no product weight")
         if not t["time_in"]:
             bad("tickets", line, "time_in is missing")
         for field in ("time_in", "time_out"):
@@ -382,11 +398,12 @@ def check_data():
                 except ValueError:
                     bad("tickets", line, f"{field} is not a YYYY-MM-DD HH:MM:SS time ({t[field]!r})")
     for table, fields in OTHER_INT_FIELDS.items():
-        for line, row in enumerate(read_table(table), 2):
+        for line, row in enumerate(tables.get(table, []), 2):
             for field in fields:
                 if not is_whole(row[field]):
                     bad(table, line, f"{field} is not a whole number ({row[field]!r})")
-    next_wb = get_setting("next_wb_number", "1")
+    next_wb = next((row["value"] for row in tables.get("settings", [])
+                    if row["key"] == "next_wb_number"), "1")
     if next_wb and not is_whole(next_wb):
         problems.append(f"settings.csv: next_wb_number is not a whole number ({next_wb!r})")
     return problems
@@ -1160,8 +1177,12 @@ def review_ticket(wb_number):
 
 def submit_ticket(tickets, t):
     t.update(status="COMPLETE", operator=get_setting("operator_name"))
-    commit(with_audit({"tickets": tickets}, "SUBMIT", t["wb_number"],
-                      f"total {t['payable_weight']}"))
+    try:
+        commit(with_audit({"tickets": tickets}, "SUBMIT", t["wb_number"],
+                          f"total {t['payable_weight']}"))
+    except DeferredInterrupt:
+        save_receipt(t)  # the ticket was saved before Ctrl+C took effect
+        raise
     heading(f"TICKET {t['wb_number']} SUBMITTED")
     show_receipt(t)
     saved = save_receipt(t)
@@ -1247,7 +1268,13 @@ def void_ticket():
     if not confirm(f"Void ticket {t['wb_number']}? It stays on record but leaves all totals", default=False):
         raise Cancelled
     t.update(status="VOID", void_reason=reason)
-    commit(with_audit({"tickets": tickets}, "VOID", t["wb_number"], reason))
+    try:
+        commit(with_audit({"tickets": tickets}, "VOID", t["wb_number"], reason))
+    except DeferredInterrupt:
+        # The void was saved before Ctrl+C took effect.
+        if receipt_path(t).exists():
+            save_receipt(t)
+        raise
     if receipt_path(t).exists():
         save_receipt(t)  # so the archived copy shows it is void
     info(f"Ticket {t['wb_number']} is now void.")
@@ -1462,9 +1489,27 @@ def edit_ticket():
     if t["status"] == "REVIEW":
         review_ticket(t["wb_number"])
         return
-    edit_entries(t["wb_number"])
+    # Product split edits can change only ticket_lines, so compare those too.
+    lines_before = ticket_lines_for(t["wb_number"])
+
+    def changed(updated):
+        return updated != t or ticket_lines_for(t["wb_number"]) != lines_before
+
+    finished = False
+    try:
+        edit_entries(t["wb_number"])
+        finished = True
+    finally:
+        if not finished:
+            # Edits already saved before input closed still need a fresh receipt.
+            try:
+                _, updated = load_ticket(t["wb_number"])
+                if updated["status"] == "COMPLETE" and changed(updated):
+                    save_receipt(updated)
+            except Exception:
+                log.exception("Could not refresh receipt for ticket %s", t["wb_number"])
     _, updated = load_ticket(t["wb_number"])
-    if updated["status"] == "COMPLETE" and updated != t:
+    if updated["status"] == "COMPLETE" and changed(updated):
         heading(f"UPDATED RECEIPT - TICKET {t['wb_number']}")
         show_receipt(updated)
         saved = save_receipt(updated)
@@ -1770,16 +1815,21 @@ def main(argv=None):
         return 1 if problems else 0
 
     try:
-        init_storage()
-        setup_logging()
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        lock = acquire_lock()
     except OSError as exc:
         error(f"Cannot use the data folder {DATA_DIR}: {exc}")
         return 1
-
-    lock = acquire_lock()
     if lock is None:
         error(f"The weighbridge program is already running on {DATA_DIR}.")
         info("Use the window that is already open. Two copies would overwrite each other's tickets.")
+        return 1
+    try:
+        init_storage()
+        setup_logging()
+    except OSError as exc:
+        lock.close()
+        error(f"Cannot use the data folder {DATA_DIR}: {exc}")
         return 1
     log.info("Started version %s by %s, data %s", __version__, current_user(), DATA_DIR)
     try:
