@@ -1,0 +1,5 @@
+# Live weighbridge data: tickets, driver ID numbers, backups and logs.
+data/
+
+__pycache__/
+*.py[cod]

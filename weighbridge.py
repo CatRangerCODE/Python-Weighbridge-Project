@@ -1,21 +1,37 @@
+"""Weighbridge ticketing system.
+
+A terminal program for weighing vehicles in and out, capturing deductions,
+submitting tickets and printing weighbridge notes. Data is kept in CSV files
+in the data folder (see README.md).
+"""
+
 from __future__ import annotations
 
+import argparse
 import csv
 import getpass
+import logging
 import os
+import signal
+import subprocess
 import sys
 import textwrap
+import threading
+import zipfile
+from contextlib import contextmanager
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("WEIGHBRIDGE_DATA", BASE_DIR / "data"))
-EXPORT_DIR = DATA_DIR / "exports"
+__version__ = "1.0.0"
 
-MAX_WEIGHT_KG = 100_000   
-TARE_WARN_KG = 500      
-AVG_TARE_LOADS = 10      
+BASE_DIR = Path(__file__).resolve().parent
+
+MAX_WEIGHT_KG = 100_000
+TARE_WARN_KG = 500
+AVG_TARE_LOADS = 10
+BACKUP_KEEP = 60
 DATE_FMT = "%Y-%m-%d"
 STAMP_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -24,6 +40,7 @@ COMPANY_COLLECTION = "Company Collection"
 LOADING = "Loading"
 OFFLOADING = "Offloading"
 ACTIVE_STATUSES = ("OPEN", "REVIEW")
+STATUSES = ("OPEN", "REVIEW", "COMPLETE", "VOID")
 RECEIPT_WIDTH = 52
 RECEIPT_LABEL_WIDTH = 22
 
@@ -56,16 +73,6 @@ SCHEMAS = {
 }
 
 SETTING_DEFAULTS = {
-    "company_name": "JVD Tech Weighbridge",
-    "address_1": "21 Imaginary Street",
-    "address_2": "Witbank",
-    "address_3": "Mpumalanga",
-    "address_4": "1035",
-    "address_5": "South Africa",
-    "tel": "000 000 0000",
-    "fax": "",
-    "vat_no": "1234567890",
-    "operator_name": "JVD TECH WEIGHBRIDGE",
     "next_wb_number": "1",
     "current_scale": "Manual",
 }
@@ -79,15 +86,6 @@ COMPANY_SETTINGS = [
 ]
 
 SEED_DATA = {
-    "products": [
-        {"name": "STEEL 201 PROCESSED", "default_deduction_pct": ""},
-        {"name": "STEEL 204", "default_deduction_pct": ""},
-        {"name": "STEEL GENERAL UNPROCESSED", "default_deduction_pct": ""},
-        {"name": "CONTAMINATED STEEL SCRAP", "default_deduction_pct": ""},
-    ],
-    "vehicle_types": [
-        {"name": "HORSE & TRAILER"}, {"name": "TIPPER"}, {"name": "BAKKIE"},
-    ],
     "settings": [{"key": key, "value": value} for key, value in SETTING_DEFAULTS.items()],
 }
 
@@ -99,6 +97,47 @@ class Cancelled(Exception):
 class InputClosed(Cancelled):
     """The terminal input ended, no more answers can be read."""
 
+
+log = logging.getLogger("weighbridge")
+log.addHandler(logging.NullHandler())
+
+DATA_DIR = EXPORT_DIR = BACKUP_DIR = LOG_DIR = RECEIPT_DIR = Path()
+
+
+def configure(data_dir):
+    """Point the program at a data folder."""
+    global DATA_DIR, EXPORT_DIR, BACKUP_DIR, LOG_DIR, RECEIPT_DIR
+    DATA_DIR = Path(data_dir).resolve()
+    EXPORT_DIR = DATA_DIR / "exports"
+    BACKUP_DIR = DATA_DIR / "backups"
+    LOG_DIR = DATA_DIR / "logs"
+    RECEIPT_DIR = DATA_DIR / "receipts"
+
+
+configure(os.environ.get("WEIGHBRIDGE_DATA") or BASE_DIR / "data")
+
+
+def log_path():
+    return LOG_DIR / "weighbridge.log"
+
+
+def setup_logging():
+    for handler in list(log.handlers):
+        if isinstance(handler, RotatingFileHandler):
+            log.removeHandler(handler)
+            handler.close()
+    handler = RotatingFileHandler(log_path(), maxBytes=1_000_000, backupCount=5,
+                                  encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    log.addHandler(handler)
+    log.setLevel(logging.INFO)
+
+
+def current_user():
+    try:
+        return getpass.getuser()
+    except Exception:  # getuser can fail when no user variables are set
+        return "unknown"
 
 
 # output
@@ -155,7 +194,8 @@ def table_path(name):
 
 def init_storage():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    EXPORT_DIR.mkdir(exist_ok=True)
+    for folder in (EXPORT_DIR, BACKUP_DIR, LOG_DIR, RECEIPT_DIR):
+        folder.mkdir(exist_ok=True)
     missing = {
         name: SEED_DATA.get(name, [])
         for name in SCHEMAS if not table_path(name).exists()
@@ -189,11 +229,29 @@ def write_tables(changes):
                 writer.writerows(rows)
                 handle.flush()
                 os.fsync(handle.fileno())
-        for path, temp in temp_files.items():
-            os.replace(temp, path)
+        # Ctrl+C half way through would leave some tables saved and others not.
+        with interrupts_deferred():
+            for path, temp in temp_files.items():
+                os.replace(temp, path)
     finally:
         for temp in temp_files.values():
             temp.unlink(missing_ok=True)
+
+
+@contextmanager
+def interrupts_deferred():
+    """Hold back Ctrl+C until the block has finished."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    received = []
+    previous = signal.signal(signal.SIGINT, lambda *_: received.append(True))
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    if received:
+        raise KeyboardInterrupt
 
 
 def commit(changes):
@@ -203,6 +261,7 @@ def commit(changes):
             return
         except PermissionError as exc:
             name = Path(exc.filename).name if exc.filename else "a data file"
+            log.warning("Save blocked: %s", exc)
             error(f"Cannot save {name}. It is probably open in Excel.")
             ask("Close it, then press Enter to retry (/c to cancel)")
 
@@ -210,11 +269,127 @@ def commit(changes):
 def with_audit(changes, action, wb_number, detail=""):
     audit = read_table("audit")
     audit.append({
-        "timestamp": now_stamp(), "user": getpass.getuser(), "action": action,
+        "timestamp": now_stamp(), "user": current_user(), "action": action,
         "wb_number": wb_number, "detail": detail,
     })
     changes["audit"] = audit
+    log.info("%s ticket %s: %s", action, wb_number, detail)
     return changes
+
+
+# single instance lock
+
+def acquire_lock():
+    """Lock the data folder so a second copy of the program cannot use it.
+
+    Two copies would each overwrite the other's changes. Returns the open
+    lock file (keep it open while running) or None if already locked.
+    """
+    handle = open(DATA_DIR / ".lock", "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+# backups
+
+def backup_data(keep=BACKUP_KEEP):
+    """Zip the data files once a day. Returns the new backup path, or None."""
+    target = BACKUP_DIR / f"backup_{date.today().isoformat()}.zip"
+    if target.exists():
+        return None
+    BACKUP_DIR.mkdir(exist_ok=True)
+    temp = target.with_name(target.name + ".tmp")
+    try:
+        with zipfile.ZipFile(temp, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name in SCHEMAS:
+                path = table_path(name)
+                if path.exists():
+                    archive.write(path, path.name)
+        os.replace(temp, target)
+    finally:
+        temp.unlink(missing_ok=True)
+    for old in sorted(BACKUP_DIR.glob("backup_*.zip"))[:-keep]:
+        old.unlink(missing_ok=True)
+    return target
+
+
+_backup_warned_on = None
+
+
+def run_daily_backup():
+    global _backup_warned_on
+    try:
+        made = backup_data()
+        if made:
+            log.info("Backup written to %s", made)
+    except OSError as exc:
+        log.warning("Backup failed: %s", exc)
+        if _backup_warned_on != date.today():
+            _backup_warned_on = date.today()
+            warn(f"Today's backup could not be made: {exc}")
+
+
+# data checks
+
+TICKET_INT_FIELDS = ("wb_number", "first_weight", "second_weight", "product_weight",
+                     "moisture_kg", "deduction_kg", "payable_weight", "cust_weight")
+OTHER_INT_FIELDS = {"weighings": ("seq", "weight_kg"), "ticket_lines": ("net_kg", "payable_kg")}
+
+
+def is_whole(value):
+    return value.isascii() and value.isdigit()
+
+
+def check_data():
+    """Look for damaged rows, for example after a file was edited by hand."""
+    problems = []
+
+    def bad(table, line, text):
+        problems.append(f"{table}.csv line {line}: {text}")
+
+    seen = set()
+    for line, t in enumerate(read_table("tickets"), 2):
+        for field in TICKET_INT_FIELDS:
+            if t[field] and not is_whole(t[field]):
+                bad("tickets", line, f"{field} is not a whole number ({t[field]!r})")
+        if not t["wb_number"]:
+            bad("tickets", line, "wb_number is missing")
+        elif t["wb_number"] in seen:
+            bad("tickets", line, f"WB number {t['wb_number']} is used more than once")
+        seen.add(t["wb_number"])
+        if t["status"] not in STATUSES:
+            bad("tickets", line, f"unknown status {t['status']!r}")
+        if not t["first_weight"]:
+            bad("tickets", line, "first_weight is missing")
+        if t["status"] in ("REVIEW", "COMPLETE") and not (t["second_weight"] and t["payable_weight"]):
+            bad("tickets", line, f"{t['status']} ticket has no second or total weight")
+        if not t["time_in"]:
+            bad("tickets", line, "time_in is missing")
+        for field in ("time_in", "time_out"):
+            if t[field]:
+                try:
+                    datetime.strptime(t[field], STAMP_FMT)
+                except ValueError:
+                    bad("tickets", line, f"{field} is not a YYYY-MM-DD HH:MM:SS time ({t[field]!r})")
+    for table, fields in OTHER_INT_FIELDS.items():
+        for line, row in enumerate(read_table(table), 2):
+            for field in fields:
+                if not is_whole(row[field]):
+                    bad(table, line, f"{field} is not a whole number ({row[field]!r})")
+    next_wb = get_setting("next_wb_number", "1")
+    if next_wb and not is_whole(next_wb):
+        problems.append(f"settings.csv: next_wb_number is not a whole number ({next_wb!r})")
+    return problems
 
 
 def get_setting(key, default=None):
@@ -315,29 +490,33 @@ def clean_reg(value):
 def pick(table, label, default="", required=False, allowed=()):
     key = SCHEMAS[table][0]
     shown = []
+    listed_for = None  # the text whose partial matches are on screen
+    hint = "? = list" if required else "? = list, - = clear"
     while True:
-        raw = ask(f"{label} (? = list)", default, required)
-        if not raw:
+        raw = ask(f"{label} ({hint})", default, required)
+        if not raw or (raw == "-" and not required):
             return ""
         rows = read_table(table)
         names = [row[key] for row in rows]
         if raw == "?":
-            shown = names
+            shown, listed_for = names, None
             show_choices(shown)
             continue
-        if shown and raw.isdigit() and 1 <= int(raw) <= len(shown):
-            return shown[int(raw) - 1]
         value = " ".join(raw.upper().split())
+        again = value == listed_for  # typed the same text again: they want it as new
+        if shown and not again and raw.isdigit() and 1 <= int(raw) <= len(shown):
+            return shown[int(raw) - 1]
         if value in names or value in allowed:
             return value
         matches = [name for name in names if value in name]
         if len(matches) == 1 and confirm(f"Use {matches[0]}?"):
             return matches[0]
-        if len(matches) > 1:
-            shown = matches
+        if len(matches) > 1 and not again:
+            shown, listed_for = matches, value
             show_choices(shown)
+            info(f"Type a number to choose, or type {value} again to add it as new.")
             continue
-        if not matches and confirm(f"{value} is new. Add it?"):
+        if (not matches or again) and confirm(f"{value} is new. Add it?"):
             rows.append({key: value})
             commit({table: rows})
             return value
@@ -483,13 +662,18 @@ def receipt_vehicle(value):
 
 def render_receipt(t):
     rule = "-" * RECEIPT_WIDTH
-    out = [get_setting("company_name")]
-    out += [get_setting(f"address_{n}") for n in range(1, 6) if get_setting(f"address_{n}")]
-    out.append("")
-    for label, key in (("Tel", "tel"), ("Fax", "fax"), ("Vat No.", "vat_no")):
-        if get_setting(key):
-            out.append(f"{label}: {get_setting(key)}")
-    out += ["", "WEIGHBRIDGE NOTE", rule]
+    letterhead = [get_setting(key) for key in ("company_name", "address_1", "address_2",
+                                                "address_3", "address_4", "address_5")]
+    out = [line for line in letterhead if line]
+    contacts = [f"{label}: {get_setting(key)}"
+                for label, key in (("Tel", "tel"), ("Fax", "fax"), ("Vat No.", "vat_no"))
+                if get_setting(key)]
+    if out and contacts:
+        out.append("")
+    out += contacts
+    if out:
+        out.append("")
+    out += ["WEIGHBRIDGE NOTE", rule]
     banner = {"OPEN": "*** FIRST WEIGH ONLY ***", "REVIEW": "*** DRAFT - NOT SUBMITTED ***",
               "VOID": "*** VOID - NOT VALID ***"}.get(t["status"])
     if banner:
@@ -547,6 +731,44 @@ def show_receipt(t):
     for line in render_receipt(t).splitlines():
         strong = line.startswith("Total Weight:") or line == "WEIGHBRIDGE NOTE"
         print("  " + (paint(line, "1") if strong else line))
+
+
+def receipt_path(t):
+    return RECEIPT_DIR / f"WB{t['wb_number']:0>6}.txt"
+
+
+def save_receipt(t):
+    """Write the receipt to the receipts folder. Returns the path, or None."""
+    path = receipt_path(t)
+    try:
+        RECEIPT_DIR.mkdir(exist_ok=True)
+        path.write_text(render_receipt(t) + "\n", encoding="utf-8")
+    except OSError as exc:
+        log.warning("Could not save receipt %s: %s", path, exc)
+        error(f"Could not save the receipt file: {exc}")
+        return None
+    return path
+
+
+def print_receipt(path):
+    try:
+        if os.name == "nt":
+            os.startfile(str(path), "print")
+        else:
+            subprocess.run(["lp", str(path)], check=True, capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("Printing %s failed: %s", path, exc)
+        error(f"Could not print: {exc}")
+        info(f"The receipt is saved at {path}")
+        return
+    info("Sent to the printer.")
+
+
+def offer_print(t, saved=None):
+    if confirm("Print the receipt?", default=False):
+        path = saved or save_receipt(t)
+        if path:
+            print_receipt(path)
 
 
 # weigh in
@@ -642,7 +864,7 @@ def weigh_in():
                                 (vehicle or {}).get("transporter") or previous["transporter"])
         t["driver"], t["driver_id"] = ask_driver(previous["driver"], previous["driver_id"])
         t["vehicle_description"] = pick("vehicle_types", "Vehicle description",
-                                        (vehicle or {}).get("description") or "HORSE & TRAILER")
+                                        (vehicle or {}).get("description") or previous["vehicle_description"])
         t["product"] = pick("products", "Product name", previous["product"], required=True)
         t["cust_weight"] = str(ask_int("Customer weight (kg)", default=0))
 
@@ -936,6 +1158,10 @@ def submit_ticket(tickets, t):
                       f"total {t['payable_weight']}"))
     heading(f"TICKET {t['wb_number']} SUBMITTED")
     show_receipt(t)
+    saved = save_receipt(t)
+    if saved:
+        info(f"Receipt saved to {saved}")
+    offer_print(t, saved)
 
 
 def review_menu():
@@ -978,6 +1204,8 @@ PICK_TABLES = {"transporter": "transporters", "vehicle_description": "vehicle_ty
 
 def find_ticket(tickets):
     number = ask("WB Number", required=True).strip()
+    if is_whole(number):
+        number = number.lstrip("0") or "0"
     found = next((t for t in tickets if t["wb_number"] == number), None)
     if found is None:
         error(f"Ticket {number} was not found.")
@@ -996,6 +1224,7 @@ def view_receipt():
     t = find_ticket(read_table("tickets"))
     if t:
         show_receipt(t)
+        offer_print(t)
 
 
 def void_ticket():
@@ -1013,6 +1242,8 @@ def void_ticket():
         raise Cancelled
     t.update(status="VOID", void_reason=reason)
     commit(with_audit({"tickets": tickets}, "VOID", t["wb_number"], reason))
+    if receipt_path(t).exists():
+        save_receipt(t)  # so the archived copy shows it is void
     info(f"Ticket {t['wb_number']} is now void.")
 
 
@@ -1033,6 +1264,9 @@ def save_edit(tickets, t, field, old, new, lines=None, weighings=None):
 def edit_weights(tickets, t):
     weighings = read_table("weighings")
     mine = weighings_for(t["wb_number"], weighings)
+    if not mine:
+        error("No weighings are recorded for this ticket.")
+        return
     print_table(["#", "Weight", "Time"],
                 [[i, fmt_kg(w["weight_kg"]), w["timestamp"]] for i, w in enumerate(mine, 1)])
     index = ask_int("Weight # to change", minimum=1, maximum=len(mine)) - 1
@@ -1227,6 +1461,8 @@ def edit_ticket():
     if updated["status"] == "COMPLETE" and updated != t:
         heading(f"UPDATED RECEIPT - TICKET {t['wb_number']}")
         show_receipt(updated)
+        saved = save_receipt(updated)
+        offer_print(updated, saved)
 
 
 
@@ -1295,8 +1531,14 @@ def reports():
         with open(path, "w", newline="", encoding="utf-8-sig") as handle:
             writer = csv.DictWriter(handle, fields, extrasaction="ignore")
             writer.writeheader()
-            writer.writerows(tickets)
+            writer.writerows({k: spreadsheet_safe(v) for k, v in t.items()} for t in tickets)
         info(f"Exported to {path}")
+
+
+def spreadsheet_safe(value):
+    """Stop Excel running typed text such as =HYPERLINK(...) as a formula."""
+    text = str(value)
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
 
 
 # master data and settings
@@ -1426,21 +1668,42 @@ MENU = [
 ]
 
 
-def main():
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
-    if USE_COLOR and os.name == "nt":
-        os.system("")  # Turns on colour codes in the Windows console.
-    init_storage()
-    actions = {key: action for key, _, action in MENU}
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(prog="weighbridge", description="Weighbridge ticketing system.")
+    parser.add_argument("--data", type=Path, metavar="FOLDER",
+                        help="data folder (default: WEIGHBRIDGE_DATA or ./data next to this file)")
+    parser.add_argument("--check", action="store_true",
+                        help="check the data files for damaged rows and exit")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    return parser.parse_args(argv)
 
-    while True:
+
+def show_menu_header():
+    try:
         tickets = read_table("tickets")
-        heading(f"{get_setting('company_name')} - WEIGHBRIDGE SYSTEM")
-        print(f"  {date.today().isoformat()}   Scale: {get_setting('current_scale')}   "
-              f"On site: {len(open_tickets(tickets))}   "
-              f"To submit: {len(review_tickets(tickets))}   Next WB: {next_wb_number(tickets)}\n")
+        status = (f"On site: {len(open_tickets(tickets))}   "
+                  f"To submit: {len(review_tickets(tickets))}   Next WB: {next_wb_number(tickets)}")
+        title = get_setting("company_name")
+        missing_company = not title
+    except Exception:
+        log.exception("Could not read data for the main menu")
+        title, status = "", paint("Could not read the data files, see the log", "31")
+        missing_company = False
+    heading(f"{title} - WEIGHBRIDGE SYSTEM" if title else "WEIGHBRIDGE SYSTEM")
+    try:
+        scale = get_setting("current_scale")
+    except Exception:
+        scale = "?"
+    print(f"  {date.today().isoformat()}   Scale: {scale}   {status}\n")
+    if missing_company:
+        warn("Company details are not set, so receipts have no letterhead. Add them under Settings.\n")
+
+
+def run_menu():
+    actions = {key: (label, action) for key, label, action in MENU}
+    while True:
+        run_daily_backup()
+        show_menu_header()
         for key, label, _ in MENU:
             print(f"  {key:>2}. {label}")
         print("   0. Exit")
@@ -1451,18 +1714,79 @@ def main():
             return
         if choice == "0":
             return
-        action = actions.get(choice)
-        if action is None:
+        if choice not in actions:
             error("Choose a number from the menu.")
             continue
+        label, action = actions[choice]
         try:
             action()
         except (Cancelled, KeyboardInterrupt):
             print()
             info("Cancelled. Nothing further was saved.")
         except OSError as exc:
+            log.exception("File problem during %s", label)
             error(f"File problem: {exc}")
+        except Exception as exc:
+            log.exception("Unexpected error during %s", label)
+            error(f"Something went wrong ({type(exc).__name__}: {exc}). "
+                  f"The action was stopped. Details are in {log_path()}")
+            info("If a data file was edited by hand, run the program with --check.")
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    if USE_COLOR and os.name == "nt":
+        os.system("")  # Turns on colour codes in the Windows console.
+    if args.data:
+        configure(args.data)
+    try:
+        init_storage()
+        setup_logging()
+    except OSError as exc:
+        error(f"Cannot use the data folder {DATA_DIR}: {exc}")
+        return 1
+
+    if args.check:
+        problems = check_data()
+        for problem in problems:
+            print(f"  {problem}")
+        info("No problems found." if not problems else f"{len(problems)} problem(s) found.")
+        return 1 if problems else 0
+
+    lock = acquire_lock()
+    if lock is None:
+        error(f"The weighbridge program is already running on {DATA_DIR}.")
+        info("Use the window that is already open. Two copies would overwrite each other's tickets.")
+        return 1
+    log.info("Started version %s by %s, data %s", __version__, current_user(), DATA_DIR)
+    try:
+        try:
+            problems = check_data()
+        except Exception as exc:
+            log.exception("Data check failed")
+            problems = [f"The data files could not be checked: {exc}"]
+        if problems:
+            log.warning("Data check found %d problem(s): %s", len(problems), "; ".join(problems))
+            heading("DATA PROBLEMS FOUND")
+            for problem in problems[:20]:
+                warn(problem)
+            if len(problems) > 20:
+                warn(f"... and {len(problems) - 20} more (see {log_path()})")
+            info("Close the program to fix these files by hand, or restore a backup.")
+            try:
+                input("  Press Enter to continue anyway: ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 1
+        run_menu()
+    finally:
+        log.info("Stopped")
+        lock.close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
