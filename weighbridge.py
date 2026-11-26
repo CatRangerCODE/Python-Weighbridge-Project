@@ -504,9 +504,15 @@ def pick(table, label, default="", required=False, allowed=()):
             continue
         value = " ".join(raw.upper().split())
         again = value == listed_for  # typed the same text again: they want it as new
+        exact = value in names or value in allowed
         if shown and not again and raw.isdigit() and 1 <= int(raw) <= len(shown):
-            return shown[int(raw) - 1]
-        if value in names or value in allowed:
+            choice = shown[int(raw) - 1]
+            # A name that is itself this number: say which one will be used.
+            if not exact or choice == value or confirm(
+                    f"Number {raw} in the list is {choice}. Use it? (n = use the name {value})"):
+                return choice
+            return value
+        if exact:
             return value
         matches = [name for name in names if value in name]
         if len(matches) == 1 and confirm(f"Use {matches[0]}?"):
@@ -1742,19 +1748,33 @@ def main(argv=None):
         os.system("")  # Turns on colour codes in the Windows console.
     if args.data:
         configure(args.data)
+
+    if args.check:
+        # Read-only: do not create folders, seed tables or open the log file.
+        missing = [f"{table_path(name)}: file is missing"
+                   for name in SCHEMAS if not table_path(name).exists()]
+        if missing:
+            for problem in missing:
+                print(f"  {problem}")
+            info(f"{len(missing)} problem(s) found.")
+            return 1
+        try:
+            problems = check_data()
+        except Exception as exc:
+            log.exception("Data check failed")
+            error(f"The data files could not be checked: {exc}")
+            return 1
+        for problem in problems:
+            print(f"  {problem}")
+        info("No problems found." if not problems else f"{len(problems)} problem(s) found.")
+        return 1 if problems else 0
+
     try:
         init_storage()
         setup_logging()
     except OSError as exc:
         error(f"Cannot use the data folder {DATA_DIR}: {exc}")
         return 1
-
-    if args.check:
-        problems = check_data()
-        for problem in problems:
-            print(f"  {problem}")
-        info("No problems found." if not problems else f"{len(problems)} problem(s) found.")
-        return 1 if problems else 0
 
     lock = acquire_lock()
     if lock is None:
